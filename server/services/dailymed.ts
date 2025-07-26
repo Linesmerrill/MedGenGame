@@ -187,7 +187,8 @@ export class DailyMedService {
 
   async searchMultipleMedications(
     patientInfo: string, 
-    openAIExtractedMeds?: Array<{name: string, dosage?: string, formulation: 'IR' | 'ER', deliveryMethod?: string, fullContext: string}>
+    openAIExtractedMeds?: Array<{name: string, dosage?: string, formulation: 'IR' | 'ER', deliveryMethod?: string, fullContext: string}>,
+    useParallel: boolean = true
   ): Promise<{results: DailyMedDetails[], searchLog: Array<{medication: string, searchTerm: string, found: boolean, resultTitle?: string, error?: string, rejectedReasons?: string[]}>}> {
     // Use OpenAI extracted medications if provided, otherwise fall back to pattern matching
     const medications = openAIExtractedMeds || this.extractMedicationNames(patientInfo).map(med => ({
@@ -201,7 +202,24 @@ export class DailyMedService {
 
     console.log(`Processing ${medications.length} medications:`, medications.map(m => `${m.name} (${m.deliveryMethod || 'unspecified delivery method'})`));
 
-    for (const medication of medications) {
+    if (useParallel && medications.length > 1) {
+      // Process medications in parallel for faster execution
+      const searchPromises = medications.map((medication, index) => 
+        this.searchSingleMedication(medication, index)
+      );
+      
+      const searchResults = await Promise.all(searchPromises);
+      
+      // Combine results and logs
+      for (const result of searchResults) {
+        if (result.details) {
+          results.push(result.details);
+        }
+        searchLog.push(...result.logs);
+      }
+    } else {
+      // Sequential processing (original logic)
+      for (const medication of medications) {
       try {
         // Create more specific search terms based on delivery method and formulation
         const searchTerms = this.generateSearchTerms(medication);
@@ -337,9 +355,150 @@ export class DailyMedService {
         });
         continue;
       }
+      }
     }
 
     return { results, searchLog };
+  }
+
+  private async searchSingleMedication(
+    medication: {name: string, dosage?: string, formulation: 'IR' | 'ER', deliveryMethod?: string, fullContext: string},
+    index: number
+  ): Promise<{details: DailyMedDetails | null, logs: Array<{medication: string, searchTerm: string, found: boolean, resultTitle?: string, error?: string, rejectedReasons?: string[]}>}> {
+    const logs: Array<{medication: string, searchTerm: string, found: boolean, resultTitle?: string, error?: string, rejectedReasons?: string[]}> = [];
+    
+    try {
+      const searchTerms = this.generateSearchTerms(medication);
+      let bestResult: any = null;
+      let bestSearchTerm = '';
+      let allRejectedReasons: string[] = [];
+      let searchErrors: string[] = [];
+
+      console.log(`Generated ${searchTerms.length} search terms for ${medication.name} (${medication.formulation}):`, searchTerms.slice(0, 5));
+
+      // Try each search term until we find a good match
+      for (const searchTerm of searchTerms) {
+        console.log(`Searching DailyMed for: "${searchTerm}" (${medication.formulation} formulation)`);
+        
+        try {
+          const searchResults = await this.searchMedications(searchTerm);
+          
+          const logEntry = {
+            medication: medication.name,
+            searchTerm: searchTerm,
+            found: searchResults.length > 0,
+            resultTitle: searchResults.length > 0 ? searchResults[0].title : undefined,
+            rejectedReasons: [] as string[],
+            requestedFormulation: medication.formulation,
+            deliveryMethod: medication.deliveryMethod || 'unspecified'
+          };
+
+          if (searchResults.length > 0) {
+            let foundAppropriate = false;
+            for (const result of searchResults.slice(0, 3)) {
+              const matchResult = this.isAppropriateMatchWithReasons(medication, result);
+              if (matchResult.isMatch) {
+                bestResult = result;
+                bestSearchTerm = searchTerm;
+                console.log(`Found appropriate match: ${result.title} for search term: "${searchTerm}"`);
+                foundAppropriate = true;
+                break;
+              } else {
+                logEntry.rejectedReasons.push(`${result.title}: ${matchResult.reason}`);
+                allRejectedReasons.push(`${result.title}: ${matchResult.reason}`);
+              }
+            }
+            
+            if (!foundAppropriate && searchResults.length > 0) {
+              console.log(`Found ${searchResults.length} results for "${searchTerm}" but none were appropriate matches`);
+            }
+          } else {
+            console.log(`No results found for search term: "${searchTerm}"`);
+            logEntry.error = 'No results found in DailyMed database';
+          }
+
+          logs.push(logEntry);
+
+          if (bestResult) break;
+          
+        } catch (searchError) {
+          console.error(`Search error for "${searchTerm}":`, searchError);
+          searchErrors.push(`Error searching "${searchTerm}": ${searchError}`);
+          logs.push({
+            medication: medication.name,
+            searchTerm: searchTerm,
+            found: false,
+            error: `Search failed: ${searchError}`,
+            requestedFormulation: medication.formulation,
+            deliveryMethod: medication.deliveryMethod || 'unspecified'
+          });
+        }
+        
+        // Add delay between searches to avoid rate limiting
+        await new Promise(resolve => setTimeout(resolve, 300));
+      }
+
+      // If we still haven't found anything, try relaxed search criteria
+      if (!bestResult) {
+        console.log(`No matches found with standard criteria. Trying relaxed search for ${medication.name}...`);
+        const relaxedResult = await this.tryRelaxedSearch(medication, logs, allRejectedReasons);
+        if (relaxedResult.result) {
+          bestResult = relaxedResult.result;
+          bestSearchTerm = relaxedResult.searchTerm;
+          console.log(`Found match with relaxed criteria: ${bestResult.title}`);
+        }
+      }
+      
+      if (bestResult) {
+        const details: DailyMedDetails = {
+          setId: bestResult.setId,
+          title: bestResult.title,
+          genericName: bestResult.genericName,
+          brandName: bestResult.brandName,
+          labeler: bestResult.labeler,
+          activeIngredients: bestResult.genericName ? [bestResult.genericName] : [],
+          indications: this.getCommonIndications(medication.name, medication.formulation),
+          dosageAndAdministration: this.getCommonDosage(medication.name, medication.formulation),
+          contraindications: this.getCommonContraindications(medication.name, medication.formulation),
+          warningsAndPrecautions: this.getCommonWarnings(medication.name, medication.formulation),
+          adverseReactions: this.getCommonSideEffects(medication.name, medication.formulation),
+        };
+        
+        console.log(`Successfully processed medication: ${medication.name} with search term: "${bestSearchTerm}"`);
+        return { details, logs };
+      } else {
+        const failureReason = searchErrors.length > 0 
+          ? `Search errors: ${searchErrors.join('; ')}`
+          : allRejectedReasons.length > 0 
+            ? `Found results but all were rejected: ${allRejectedReasons.slice(0, 3).join('; ')}`
+            : 'No results found in DailyMed database';
+            
+        console.log(`FAILED to find ${medication.name}: ${failureReason}`);
+        
+        logs.push({
+          medication: medication.name,
+          searchTerm: 'SEARCH_FAILED',
+          found: false,
+          error: failureReason,
+          rejectedReasons: allRejectedReasons.slice(0, 5),
+          requestedFormulation: medication.formulation,
+          deliveryMethod: medication.deliveryMethod || 'unspecified'
+        });
+        
+        return { details: null, logs };
+      }
+    } catch (error) {
+      console.error(`Error processing medication ${medication.name}:`, error);
+      logs.push({
+        medication: medication.name,
+        searchTerm: 'PROCESSING_ERROR',
+        found: false,
+        error: `Processing failed: ${error}`,
+        requestedFormulation: medication.formulation,
+        deliveryMethod: medication.deliveryMethod || 'unspecified'
+      });
+      return { details: null, logs };
+    }
   }
 
   private generateSearchTerms(medication: {name: string, dosage?: string, formulation: 'IR' | 'ER', deliveryMethod?: string, fullContext: string}): string[] {
@@ -536,7 +695,7 @@ export class DailyMedService {
     return { result: null, searchTerm: '' };
   }
 
-  private isAppropriateMatchWithReasons(
+  isAppropriateMatchWithReasons(
     medication: {name: string, dosage?: string, formulation: 'IR' | 'ER', deliveryMethod?: string, fullContext: string}, 
     result: any
   ): {isMatch: boolean, reason: string} {
@@ -618,7 +777,7 @@ export class DailyMedService {
   }
 
   // Helper methods to provide common medical information
-  private getCommonIndications(medication: string, formulation: 'IR' | 'ER'): string {
+  getCommonIndications(medication: string, formulation: 'IR' | 'ER'): string {
     const baseIndications: { [key: string]: string } = {
       'metformin': 'Type 2 diabetes mellitus management to improve glycemic control',
       'lisinopril': 'Hypertension and heart failure management',
@@ -635,7 +794,7 @@ export class DailyMedService {
     return `${baseIndication} (${formulation} formulation)`;
   }
 
-  private getCommonDosage(medication: string, formulation: 'IR' | 'ER'): string {
+  getCommonDosage(medication: string, formulation: 'IR' | 'ER'): string {
     const baseDosages: { [key: string]: { IR: string; ER: string } } = {
       'metformin': {
         IR: 'Initial: 500mg twice daily with meals. Maximum: 2000mg daily (IR formulation)',
@@ -686,7 +845,7 @@ export class DailyMedService {
     return `Dosage should be individualized by healthcare provider (${formulation} formulation)`;
   }
 
-  private getCommonContraindications(medication: string, formulation: 'IR' | 'ER'): string {
+  getCommonContraindications(medication: string, formulation: 'IR' | 'ER'): string {
     const contraindications: { [key: string]: string } = {
       'metformin': 'Severe renal impairment, metabolic acidosis, diabetic ketoacidosis',
       'lisinopril': 'History of angioedema, pregnancy, bilateral renal artery stenosis',
@@ -698,7 +857,7 @@ export class DailyMedService {
     return `${baseContraindication} (applies to both IR and ER formulations)`;
   }
 
-  private getCommonWarnings(medication: string, formulation: 'IR' | 'ER'): string {
+  getCommonWarnings(medication: string, formulation: 'IR' | 'ER'): string {
     const warnings: { [key: string]: string } = {
       'metformin': 'Risk of lactic acidosis, especially in renal impairment. Monitor kidney function',
       'lisinopril': 'Monitor for hyperkalemia, renal function changes, and angioedema',
@@ -715,7 +874,7 @@ export class DailyMedService {
     return `${baseWarning} ${formulationNote}`;
   }
 
-  private getCommonSideEffects(medication: string, formulation: 'IR' | 'ER'): string {
+  getCommonSideEffects(medication: string, formulation: 'IR' | 'ER'): string {
     const sideEffects: { [key: string]: string } = {
       'metformin': 'Nausea, vomiting, diarrhea, abdominal pain, loss of appetite',
       'lisinopril': 'Dry cough, hyperkalemia, angioedema, hypotension, dizziness',

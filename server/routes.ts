@@ -37,7 +37,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       let assessment: any = null;
       let dailyMedResults: any[] = [];
       let extractedMedications: any[] = [];
-      const searchLog: Array<{medication: string, searchTerm: string, found: boolean, resultTitle?: string, error?: string, rejectedReasons?: string[], requestedFormulation?: 'IR' | 'ER', deliveryMethod?: string}> = [];
+      let searchLog: Array<{medication: string, searchTerm: string, found: boolean, resultTitle?: string, error?: string, rejectedReasons?: string[], requestedFormulation?: 'IR' | 'ER', deliveryMethod?: string}> = [];
       let medicationValidation: any = null;
 
       try {
@@ -53,6 +53,135 @@ export async function registerRoutes(app: Express): Promise<Server> {
         // Validate the matches
         medicationValidation = await openAIService.validateMedicationMatches(patientInfo, extractedMedications, dailyMedResults);
         console.log('Validation result:', medicationValidation);
+
+        // If validation failed and we have corrected search terms, retry with those
+        if (!medicationValidation.validated && medicationValidation.correctedSearchTerms && medicationValidation.correctedSearchTerms.length > 0) {
+          console.log('Validation failed, retrying with corrected search terms...');
+          
+          // Create new search results array to replace the original
+          let improvedResults: any[] = [];
+          let improvedSearchLog: any[] = [...searchLog];
+          let foundAtLeastOne = false;
+          
+          // Search with corrected search terms in parallel
+          const retrySearchPromises = medicationValidation.correctedSearchTerms.map(async (searchTerm, index) => {
+            try {
+              console.log(`Retrying search for: "${searchTerm}"`);
+              const results = await dailyMedService.searchMedications(searchTerm);
+              
+              if (results.length > 0 && index < extractedMedications.length) {
+                const medication = extractedMedications[index];
+                
+                // Find the best match from retry results
+                for (const result of results.slice(0, 3)) {
+                  const matchResult = await dailyMedService.isAppropriateMatchWithReasons(medication, result);
+                  if (matchResult.isMatch) {
+                    console.log(`Retry successful: Found ${result.title} for ${medication.name}`);
+                    
+                    // Convert to DailyMedDetails format
+                    const improvedDetails = {
+                      setId: result.setId,
+                      title: result.title,
+                      genericName: result.genericName,
+                      brandName: result.brandName,
+                      labeler: result.labeler,
+                      activeIngredients: result.genericName ? [result.genericName] : [],
+                      indications: await dailyMedService.getCommonIndications(medication.name, medication.formulation),
+                      dosageAndAdministration: await dailyMedService.getCommonDosage(medication.name, medication.formulation),
+                      contraindications: await dailyMedService.getCommonContraindications(medication.name, medication.formulation),
+                      warningsAndPrecautions: await dailyMedService.getCommonWarnings(medication.name, medication.formulation),
+                      adverseReactions: await dailyMedService.getCommonSideEffects(medication.name, medication.formulation),
+                    };
+                    
+                    return {
+                      index,
+                      medication: medication.name,
+                      searchTerm,
+                      found: true,
+                      details: improvedDetails,
+                      resultTitle: result.title
+                    };
+                  }
+                }
+              }
+              
+              return {
+                index,
+                medication: index < extractedMedications.length ? extractedMedications[index].name : 'Unknown',
+                searchTerm,
+                found: false,
+                details: null,
+                resultTitle: undefined
+              };
+              
+            } catch (error) {
+              console.error(`Retry search failed for "${searchTerm}":`, error);
+              return {
+                index,
+                medication: index < extractedMedications.length ? extractedMedications[index].name : 'Unknown',
+                searchTerm,
+                found: false,
+                details: null,
+                error: error.message
+              };
+            }
+          });
+
+          const retryResults = await Promise.all(retrySearchPromises);
+          
+          // Process retry results and build new results array
+          for (let i = 0; i < extractedMedications.length; i++) {
+            const retryResult = retryResults[i];
+            const medication = extractedMedications[i];
+            
+            if (retryResult && retryResult.found && retryResult.details) {
+              // Use the improved result
+              improvedResults[i] = retryResult.details;
+              foundAtLeastOne = true;
+              
+              // Add success log entry
+              improvedSearchLog.push({
+                medication: medication.name,
+                searchTerm: `${retryResult.searchTerm} (corrected)`,
+                found: true,
+                resultTitle: retryResult.resultTitle,
+                requestedFormulation: medication.formulation,
+                deliveryMethod: medication.deliveryMethod || 'unspecified'
+              });
+            } else {
+              // Keep original result if we had one, or add placeholder
+              if (i < dailyMedResults.length && dailyMedResults[i]) {
+                improvedResults[i] = dailyMedResults[i];
+              } else {
+                // Add placeholder for failed medication
+                improvedResults[i] = null;
+              }
+              
+              // Add failure log entry
+              improvedSearchLog.push({
+                medication: medication.name,
+                searchTerm: `${retryResult?.searchTerm || 'Unknown'} (corrected - failed)`,
+                found: false,
+                error: retryResult?.error || 'No appropriate match found',
+                requestedFormulation: medication.formulation,
+                deliveryMethod: medication.deliveryMethod || 'unspecified'
+              });
+            }
+          }
+          
+          // Only update results if we found at least one improvement
+          if (foundAtLeastOne) {
+            dailyMedResults = improvedResults.filter(result => result !== null);
+            searchLog = improvedSearchLog;
+            console.log(`Retry improved results: Found ${dailyMedResults.length} medications after corrections`);
+            
+            // Re-validate with improved results
+            medicationValidation = await openAIService.validateMedicationMatches(patientInfo, extractedMedications, dailyMedResults);
+            console.log('Re-validation result after retry:', medicationValidation);
+          } else {
+            console.log('No improvements found during retry, keeping original results');
+          }
+        }
 
         // Assess learning level
         assessment = await openAIService.assessPatientLearningLevel(patientInfo, dailyMedResults);
@@ -150,7 +279,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       processingSteps[1] = { step: "dailymed", status: "processing", message: "Extracting and searching for medications..." };
 
       let dailyMedResults: any[] = [];
-      const searchLog: Array<{medication: string, searchTerm: string, found: boolean, resultTitle?: string, error?: string, rejectedReasons?: string[], requestedFormulation?: 'IR' | 'ER', deliveryMethod?: string}> = [];
+      let searchLog: Array<{medication: string, searchTerm: string, found: boolean, resultTitle?: string, error?: string, rejectedReasons?: string[], requestedFormulation?: 'IR' | 'ER', deliveryMethod?: string}> = [];
       try {
         // Extract medications using OpenAI first
         const extractedMedications = await openAIService.extractMedicationsFromText(patientInfo);
