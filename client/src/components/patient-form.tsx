@@ -27,7 +27,14 @@ export function PatientForm({
   const [difficultyLevel, setDifficultyLevel] = useState<DifficultyLevel | 'auto'>('auto');
   const [dailyMedStatus, setDailyMedStatus] = useState<"ready" | "processing" | "complete" | "error">("ready");
   const [openAIStatus, setOpenAIStatus] = useState<"ready" | "processing" | "complete" | "error">("ready");
+  const [currentSampleIndex, setCurrentSampleIndex] = useState(0);
   const { toast } = useToast();
+
+  const samplePatientData = [
+    "Patient diagnosed with Type 2 diabetes mellitus, currently prescribed Metformin 500mg twice daily and Lisinopril 10mg once daily for mild hypertension. Recovery plan includes carbohydrate counting, regular blood glucose monitoring 3x daily, 30 minutes of moderate exercise 5 days per week, and quarterly HbA1c monitoring. Patient education needed on medication adherence, dietary modifications, and recognition of hypoglycemic episodes.",
+    "Patient diagnosed with Generalized Anxiety Disorder (GAD), currently prescribed Sertraline 50mg once daily and Lorazepam 0.5mg as needed for acute anxiety episodes. Recovery plan includes weekly cognitive behavioral therapy (CBT) sessions, daily mindfulness meditation for 15 minutes, regular sleep schedule of 7-8 hours per night, and monthly psychiatric follow-ups. Patient education needed on medication side effects, stress management techniques, and identifying anxiety triggers.",
+    "Patient diagnosed with Chronic Obstructive Pulmonary Disease (COPD), currently prescribed Albuterol inhaler as needed and Tiotropium 18mcg once daily via HandiHaler. Recovery plan includes smoking cessation, pulmonary rehabilitation with 20-minute breathing exercises 4 days per week, oxygen therapy if SpO2 drops below 88%, and annual spirometry testing. Patient education needed on proper inhaler technique, avoiding environmental triggers, and early recognition of exacerbation symptoms."
+  ];
 
   const generateModulesMutation = useMutation({
     mutationFn: async (data: { patientInfo: string; difficultyLevel: DifficultyLevel | 'auto' }) => {
@@ -100,9 +107,8 @@ export function PatientForm({
   };
 
   const loadSampleData = () => {
-    setPatientInfo(
-      "Patient diagnosed with Type 2 diabetes mellitus, currently prescribed Metformin 500mg twice daily and Lisinopril 10mg once daily for mild hypertension. Recovery plan includes carbohydrate counting, regular blood glucose monitoring 3x daily, 30 minutes of moderate exercise 5 days per week, and quarterly HbA1c monitoring. Patient education needed on medication adherence, dietary modifications, and recognition of hypoglycemic episodes."
-    );
+    setPatientInfo(samplePatientData[currentSampleIndex]);
+    setCurrentSampleIndex((prevIndex) => (prevIndex + 1) % samplePatientData.length);
   };
 
   const getStatusDisplay = (status: string) => {

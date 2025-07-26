@@ -13,7 +13,7 @@ export class OpenAIService {
   ): Promise<LearningAssessment> {
     try {
       const medicalContext = this.buildMedicalContext(patientInfo, dailyMedResults);
-      
+
       const prompt = `
 You are a healthcare education specialist. Analyze this patient information and recommend an appropriate learning level.
 
@@ -81,9 +81,9 @@ Return JSON with this structure:
     try {
       const assessment = await this.assessPatientLearningLevel(patientInfo, dailyMedResults);
       const levels: DifficultyLevel[] = requestedLevel ? [requestedLevel] : ['beginner', 'intermediate', 'advanced'];
-      
+
       const modules: GameModule[] = [];
-      
+
       for (const level of levels) {
         const games = await this.generateGamesForLevel(patientInfo, dailyMedResults, level);
         modules.push({
@@ -94,7 +94,7 @@ Return JSON with this structure:
           games
         });
       }
-      
+
       return modules;
     } catch (error) {
       console.error('Error generating modular games:', error);
@@ -134,7 +134,7 @@ Return JSON with this structure:
     try {
       const medicalContext = this.buildMedicalContext(patientInfo, dailyMedResults);
       const difficultyGuidelines = this.getDifficultyGuidelines(level);
-      
+
       const prompt = `
 You are a healthcare education specialist creating ${level}-level educational games for patients.
 
@@ -249,7 +249,7 @@ Return your response as a JSON object with this exact structure:
       });
 
       const result = JSON.parse(response.choices[0].message.content || "{}");
-      
+
       if (!result.games || !Array.isArray(result.games)) {
         throw new Error("Invalid response format from OpenAI");
       }
@@ -316,10 +316,10 @@ ADVANCED LEVEL Guidelines:
 
   private buildMedicalContext(patientInfo: string, dailyMedResults: DailyMedDetails[]): string {
     let context = `Patient Information:\n${patientInfo}\n\n`;
-    
+
     if (dailyMedResults.length > 0) {
       context += "Medication Information from DailyMed:\n";
-      
+
       dailyMedResults.forEach((med, index) => {
         context += `\n${index + 1}. ${med.title}\n`;
         if (med.genericName) context += `Generic Name: ${med.genericName}\n`;
@@ -330,8 +330,224 @@ ADVANCED LEVEL Guidelines:
         if (med.dosageAndAdministration) context += `Dosage: ${med.dosageAndAdministration.substring(0, 200)}...\n`;
       });
     }
-    
+
     return context;
+  }
+
+  async extractMedicationsFromText(patientInfo: string): Promise<Array<{name: string, dosage: string, formulation: 'IR' | 'ER', deliveryMethod?: string, fullContext: string}>> {
+    try {
+      const prompt = `
+You are a medical information extraction specialist. Extract medication information from the following patient text.
+
+Patient Information:
+${patientInfo}
+
+For each medication found, extract:
+1. Medication name (generic name preferred)
+2. Dosage with units (e.g., "40mg", "5mg", "10mg twice daily")
+3. Delivery method (tablet, capsule, inhaler, injection, etc.)
+4. Formulation type: 
+   - CRITICAL: Default to "IR" (Immediate Release) unless explicitly stated as ER/XR/Extended-Release
+   - Only mark as "ER" if explicitly mentioned as extended-release, XR, ER, sustained-release, etc.
+5. Full context where the medication appears
+
+Return JSON array with this structure:
+[
+  {
+    "name": "medication_name",
+    "dosage": "amount with units",
+    "formulation": "IR" | "ER", 
+    "deliveryMethod": "tablet/capsule/inhaler/etc",
+    "fullContext": "complete sentence or phrase where this medication appears"
+  }
+]
+
+Requirements:
+- CRITICAL: Default ALL medications to IR unless explicitly stated as ER/XR/Extended-Release
+- Extract exact dosage amounts (e.g., 40mg, 6.25mg, 49/51mg for combinations)
+- Include formulation type (IR vs ER) in medication references when relevant`;
+
+      const response = await openai.chat.completions.create({
+        model: "gpt-4o",
+        messages: [
+          {
+            role: "system",
+            content: "You are a medical information extraction specialist. Respond only with valid JSON. Default ALL medications to IR unless explicitly stated as ER/XR/Extended-Release."
+          },
+          {
+            role: "user",
+            content: prompt
+          }
+        ],
+        response_format: { type: "json_object" },
+        temperature: 0.1,
+        max_tokens: 1500
+      });
+
+      const result = JSON.parse(response.choices[0].message.content || "{}");
+      const medications = result.medications || [];
+
+      // Process medications with smart IR/ER logic
+      return medications.map((med: any) => {
+        let finalFormulation = 'IR'; // Always default to IR
+
+        // Only set to ER if explicitly mentioned
+        if (med.formulation === 'ER' && this.isExplicitlyER(med.fullContext)) {
+          finalFormulation = 'ER';
+        }
+
+        return {
+          name: med.name || '',
+          dosage: med.dosage || '',
+          formulation: finalFormulation as 'IR' | 'ER',
+          deliveryMethod: med.deliveryMethod || '',
+          fullContext: med.fullContext || ''
+        };
+      });
+
+    } catch (error) {
+      console.error('Error extracting medications with OpenAI:', error);
+      return [];
+    }
+  }
+
+  private isExplicitlyER(context: string): boolean {
+    const erKeywords = /\b(extended.?release|extended.?release|er|xl|xr|sustained.?release|sr|la|long.?acting)\b/i;
+    return erKeywords.test(context);
+  }
+
+  async validateDosageAvailability(
+    medication: {name: string, dosage: string, formulation: 'IR' | 'ER'},
+    searchResults: any[]
+  ): Promise<{formulation: 'IR' | 'ER', reasoning: string}> {
+    // Check if the specific dosage exists in the requested formulation
+    const dosagePattern = this.extractDosageNumbers(medication.dosage);
+
+    // Look through search results to see what formulations are available with this dosage
+    const availableFormulations = {
+      IR: false,
+      ER: false
+    };
+
+    for (const result of searchResults) {
+      const title = result.title?.toLowerCase() || '';
+      const hasMatchingDosage = dosagePattern.some(dose => title.includes(dose));
+
+      if (hasMatchingDosage) {
+        const erIndicators = /\b(extended.release|extended-release|er|xl|xr|sustained.release|sustained-release|sr|la)\b/i;
+        const irIndicators = /\b(immediate.release|immediate-release|ir)\b/i;
+
+        if (erIndicators.test(title)) {
+          availableFormulations.ER = true;
+        } else if (irIndicators.test(title) || !erIndicators.test(title)) {
+          // If no specific formulation mentioned, assume IR (most common)
+          availableFormulations.IR = true;
+        }
+      }
+    }
+
+    // Apply logic: prefer IR, only use ER if explicitly requested AND available
+    if (medication.formulation === 'ER' && availableFormulations.ER) {
+      return { formulation: 'ER', reasoning: 'ER explicitly requested and available' };
+    } else if (medication.formulation === 'ER' && !availableFormulations.ER && availableFormulations.IR) {
+      return { formulation: 'IR', reasoning: 'ER requested but not available, defaulting to IR' };
+    } else if (availableFormulations.IR) {
+      return { formulation: 'IR', reasoning: 'IR is default and available' };
+    } else if (availableFormulations.ER) {
+      return { formulation: 'ER', reasoning: 'only ER formulation available' };
+    } else {
+      return { formulation: 'IR', reasoning: 'no specific dosage found, defaulting to IR' };
+    }
+  }
+
+  private extractDosageNumbers(dosage: string): string[] {
+    // Extract numbers and common patterns from dosage string
+    const patterns: string[] = [];
+
+    // Match common dosage patterns
+    const matches = dosage.match(/\d+(?:\.\d+)?/g);
+    if (matches) {
+      matches.forEach(match => {
+        patterns.push(match + 'mg');
+        patterns.push(match + ' mg');
+        patterns.push(match);
+      });
+    }
+
+    // Handle combination drugs (e.g., "49/51mg")
+    const combinationMatch = dosage.match(/(\d+(?:\.\d+)?)\/(\d+(?:\.\d+)?)/);
+    if (combinationMatch) {
+      patterns.push(`${combinationMatch[1]}/${combinationMatch[2]}`);
+      patterns.push(`${combinationMatch[1]} / ${combinationMatch[2]}`);
+      patterns.push(`${combinationMatch[1]}-${combinationMatch[2]}`);
+    }
+
+    return [...new Set(patterns)];
+  }
+
+  async validateMedicationMatches(
+    originalPatientInfo: string,
+    extractedMeds: Array<{name: string, dosage: string, formulation: 'IR' | 'ER', deliveryMethod?: string, fullContext: string}>,
+    dailyMedResults: DailyMedDetails[]
+  ): Promise<{validated: boolean, issues: string[], correctedSearchTerms?: string[]}> {
+    try {
+      const prompt = `
+You are a medical validation specialist. Compare the original patient information with the medications found in the DailyMed database to ensure accuracy.
+
+Original Patient Information:
+${originalPatientInfo}
+
+Extracted Medications:
+${extractedMeds.map((med, i) => `${i+1}. ${med.name} (${med.deliveryMethod || 'unspecified'}) - Context: "${med.fullContext}"`).join('\n')}
+
+DailyMed Results Found:
+${dailyMedResults.map((med, i) => `${i+1}. ${med.title} - Generic: ${med.genericName || 'N/A'}`).join('\n')}
+
+Please validate:
+1. Do the DailyMed results match the specific medications mentioned in the patient info?
+2. Are the delivery methods correct (e.g., inhaler vs solution)?
+3. Are we missing any medications or finding incorrect ones?
+4. What search terms would be more accurate?
+
+Return JSON with this structure:
+{
+  "validated": true/false,
+  "issues": ["list of any problems found"],
+  "correctedSearchTerms": ["better search terms if needed"]
+}`;
+
+      const response = await openai.chat.completions.create({
+        model: "gpt-4o",
+        messages: [
+          {
+            role: "system",
+            content: "You are a medical validation specialist. Respond only with valid JSON."
+          },
+          {
+            role: "user",
+            content: prompt
+          }
+        ],
+        response_format: { type: "json_object" },
+        temperature: 0.1,
+        max_tokens: 800
+      });
+
+      const result = JSON.parse(response.choices[0].message.content || "{}");
+      return {
+        validated: result.validated || false,
+        issues: result.issues || [],
+        correctedSearchTerms: result.correctedSearchTerms || []
+      };
+
+    } catch (error) {
+      console.error('Error validating medication matches:', error);
+      return {
+        validated: false,
+        issues: ['Validation failed due to technical error'],
+        correctedSearchTerms: []
+      };
+    }
   }
 
   async simplifyMedicalText(text: string): Promise<string> {

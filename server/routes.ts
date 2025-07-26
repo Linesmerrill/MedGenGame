@@ -5,7 +5,7 @@ import { dailyMedService } from "./services/dailymed";
 import { openAIService } from "./services/openai";
 
 export async function registerRoutes(app: Express): Promise<Server> {
-  
+
   // New modular route for adaptive learning
   app.post("/api/generate-modules", async (req, res) => {
     try {
@@ -31,22 +31,37 @@ export async function registerRoutes(app: Express): Promise<Server> {
       // Step 1: Parse patient information
       processingSteps[0] = { step: "parse", status: "complete", message: "Patient information parsed successfully" };
 
-      // Step 2: Assess learning level
-      processingSteps[1] = { step: "assess", status: "processing", message: "Analyzing patient background..." };
-      
+      // Step 2: Extract medications using OpenAI
+      processingSteps[1] = { step: "assess", status: "processing", message: "Extracting medications from patient information..." };
+
       let assessment: any = null;
       let dailyMedResults: any[] = [];
-      
+      let extractedMedications: any[] = [];
+      const searchLog: Array<{medication: string, searchTerm: string, found: boolean, resultTitle?: string, error?: string, rejectedReasons?: string[], requestedFormulation?: 'IR' | 'ER', deliveryMethod?: string}> = [];
+      let medicationValidation: any = null;
+
       try {
-        // Get DailyMed results first for assessment
-        dailyMedResults = await dailyMedService.searchMultipleMedications(patientInfo);
-        
+        // Extract medications using OpenAI first
+        extractedMedications = await openAIService.extractMedicationsFromText(patientInfo);
+        console.log('OpenAI extracted medications:', extractedMedications);
+
+        // Get DailyMed results using extracted medications
+        const searchResult = await dailyMedService.searchMultipleMedications(patientInfo, extractedMedications);
+        dailyMedResults = searchResult.results;
+        searchLog = searchResult.searchLog;
+
+        // Validate the matches
+        medicationValidation = await openAIService.validateMedicationMatches(patientInfo, extractedMedications, dailyMedResults);
+        console.log('Validation result:', medicationValidation);
+
         // Assess learning level
         assessment = await openAIService.assessPatientLearningLevel(patientInfo, dailyMedResults);
+
+        const validationStatus = medicationValidation.validated ? "✓" : "⚠️";
         processingSteps[1] = { 
           step: "assess", 
-          status: "complete", 
-          message: `Recommended starting level: ${assessment.suggestedStartingLevel}` 
+          status: medicationValidation.validated ? "complete" : "warning", 
+          message: `${validationStatus} Extracted ${extractedMedications.length} medications, found ${dailyMedResults.length} matches. Level: ${assessment.suggestedStartingLevel}` 
         };
       } catch (error) {
         console.error('Assessment error:', error);
@@ -58,10 +73,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       // Step 3: Query DailyMed API (already done above)
+      const dailyMedMessage = searchLog.length > 0 
+        ? `Searched: ${searchLog.map(log => `"${log.searchTerm}"`).join(', ')}. Found ${dailyMedResults.length} medications`
+        : `Found ${dailyMedResults.length} medications in database`;
+
       processingSteps[2] = { 
         step: "dailymed", 
         status: "complete", 
-        message: `Found ${dailyMedResults.length} medications in database` 
+        message: dailyMedMessage
       };
 
       // Step 4: Generate modules
@@ -75,7 +94,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       } catch (error) {
         console.error('Module generation error:', error);
         processingSteps[3] = { step: "modules", status: "error", message: "Failed to generate learning modules" };
-        
+
         return res.status(500).json({
           success: false,
           message: "Failed to generate learning modules. Please try again.",
@@ -89,6 +108,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
         modules,
         assessment,
         dailyMedResults,
+        searchLog,
+        validation: medicationValidation,
         processingSteps
       });
     } catch (error) {
@@ -125,16 +146,60 @@ export async function registerRoutes(app: Express): Promise<Server> {
       // Step 1: Parse patient information (already done by validation)
       processingSteps[0] = { step: "parse", status: "complete", message: "Patient information parsed successfully" };
 
-      // Step 2: Query DailyMed API
-      processingSteps[1] = { step: "dailymed", status: "processing", message: "Searching for medications..." };
-      
+      // Step 2: Extract and query medications
+      processingSteps[1] = { step: "dailymed", status: "processing", message: "Extracting and searching for medications..." };
+
       let dailyMedResults: any[] = [];
+      const searchLog: Array<{medication: string, searchTerm: string, found: boolean, resultTitle?: string, error?: string, rejectedReasons?: string[], requestedFormulation?: 'IR' | 'ER', deliveryMethod?: string}> = [];
       try {
-        dailyMedResults = await dailyMedService.searchMultipleMedications(patientInfo);
+        // Extract medications using OpenAI first
+        const extractedMedications = await openAIService.extractMedicationsFromText(patientInfo);
+        console.log('OpenAI extracted medications:', extractedMedications);
+
+        // Then search DailyMed with extracted medications
+        const searchResult = await dailyMedService.searchMultipleMedications(patientInfo, extractedMedications);
+        dailyMedResults = searchResult.results;
+        searchLog = searchResult.searchLog;
+
+        // Validate the matches and check dosage availability
+        const medicationValidation = await openAIService.validateMedicationMatches(patientInfo, extractedMedications, dailyMedResults);
+        console.log('Validation result:', medicationValidation);
+
+        // Apply smart IR/ER logic based on dosage availability
+        for (let i = 0; i < extractedMedications.length; i++) {
+          const med = extractedMedications[i];
+          if (med.dosage && dailyMedResults[i]) {
+            const dosageValidation = await openAIService.validateDosageAvailability(med, [dailyMedResults[i]]);
+            console.log(`Dosage validation for ${med.name}: ${dosageValidation.reasoning}`);
+
+            // Update formulation if needed
+            if (dosageValidation.formulation !== med.formulation) {
+              extractedMedications[i].formulation = dosageValidation.formulation;
+              console.log(`Updated ${med.name} formulation to ${dosageValidation.formulation}`);
+            }
+          }
+        }
+
+        const validationStatus = medicationValidation.validated ? "✓" : "⚠️";
+        // Check for failed medications
+        const failedMedications = searchLog.filter(log => 
+          log.searchTerm === 'SEARCH_FAILED' || log.searchTerm === 'PROCESSING_ERROR'
+        );
+
+        const searchDetails = searchLog.length > 0 
+          ? ` Searched: ${searchLog.filter(log => !log.searchTerm.includes('FAILED') && !log.searchTerm.includes('ERROR')).map(log => `"${log.searchTerm}"`).join(', ')}`
+          : '';
+
+        let statusMessage = `${validationStatus} Found ${dailyMedResults.length} medications.${searchDetails}`;
+
+        if (failedMedications.length > 0) {
+          statusMessage += ` ⚠️ ${failedMedications.length} medication(s) not found in database.`;
+        }
+
         processingSteps[1] = { 
           step: "dailymed", 
-          status: "complete", 
-          message: `Found ${dailyMedResults.length} medications in database` 
+          status: failedMedications.length > 0 ? "warning" : (medicationValidation.validated ? "complete" : "warning"), 
+          message: statusMessage
         };
       } catch (error) {
         console.error('DailyMed API error:', error);
@@ -159,7 +224,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         console.error('OpenAI API error:', error);
         processingSteps[2] = { step: "openai", status: "error", message: "Failed to generate content with AI" };
         processingSteps[3] = { step: "games", status: "error", message: "Could not create educational games" };
-        
+
         return res.status(500).json({
           success: false,
           message: "Failed to generate educational games. Please check your OpenAI API configuration.",
@@ -172,6 +237,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         message: `Successfully generated ${games.length} educational games`,
         games,
         dailyMedResults,
+        searchLog,
         processingSteps
       };
 

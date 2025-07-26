@@ -1,14 +1,15 @@
 import { Card, CardContent } from "@/components/ui/card";
-import { CheckCircle, Clock, AlertCircle, Loader2 } from "lucide-react";
+import { CheckCircle, Clock, AlertCircle, Loader2, XCircle } from "lucide-react";
 import type { ProcessingStep, DailyMedDetails } from "@shared/schema";
 
 interface ProcessingPipelineProps {
   steps: ProcessingStep[];
   isProcessing: boolean;
   dailyMedResults: DailyMedDetails[];
+  searchLog?: any[]; // added searchLog property to the interface
 }
 
-export function ProcessingPipeline({ steps, isProcessing, dailyMedResults }: ProcessingPipelineProps) {
+export function ProcessingPipeline({ steps, isProcessing, dailyMedResults, searchLog }: ProcessingPipelineProps) {
   const getStepIcon = (status: ProcessingStep["status"]) => {
     switch (status) {
       case "complete":
@@ -145,6 +146,42 @@ export function ProcessingPipeline({ steps, isProcessing, dailyMedResults }: Pro
             </div>
           )}
         </div>
+        {searchLog && searchLog.length > 0 && (
+            <div className="mt-4">
+              <h4 className="text-sm font-medium mb-2">Search Details:</h4>
+              <div className="space-y-1">
+                {searchLog.slice(0, 10).map((log, index) => (
+                  <div key={index} className="text-xs text-gray-600 flex items-center gap-2">
+                    {log.found ? (
+                      <CheckCircle className="w-3 h-3 text-green-500" />
+                    ) : (
+                      <XCircle className="w-3 h-3 text-red-500" />
+                    )}
+                    <span className="flex-1">
+                      <strong>{log.medication}</strong>
+                      {log.requestedFormulation && (
+                        <span className="ml-1 px-1 py-0.5 bg-blue-100 text-blue-700 rounded text-xs font-medium">
+                          {log.requestedFormulation}
+                        </span>
+                      )}
+                      {log.deliveryMethod && log.deliveryMethod !== 'unspecified' && (
+                        <span className="ml-1 px-1 py-0.5 bg-gray-100 text-gray-700 rounded text-xs">
+                          {log.deliveryMethod}
+                        </span>
+                      )}
+                      : "{log.searchTerm}"
+                      {log.resultTitle && (
+                        <span className="text-gray-500"> → {log.resultTitle}</span>
+                      )}
+                      {log.error && (
+                        <span className="text-orange-600"> ({log.error})</span>
+                      )}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
       </CardContent>
     </Card>
   );
